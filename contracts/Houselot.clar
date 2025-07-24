@@ -9,6 +9,11 @@
 (define-constant err-unit-already-allocated (err u107))
 (define-constant err-not-winner (err u108))
 (define-constant err-already-claimed (err u109))
+(define-constant err-invalid-maintenance-request (err u110))
+(define-constant err-not-tenant (err u111))
+(define-constant err-invalid-rating (err u112))
+(define-constant err-request-not-found (err u113))
+(define-constant err-invalid-status (err u114))
 
 (define-data-var lottery-active bool false)
 (define-data-var registration-deadline uint u0)
@@ -32,7 +37,10 @@
         rent: uint,
         bedrooms: uint,
         allocated: bool,
-        winner: (optional principal)
+        winner: (optional principal),
+        quality-score: uint,
+        total-ratings: uint,
+        maintenance-issues: uint
     }
 )
 
@@ -46,7 +54,32 @@
     }
 )
 
+(define-map maintenance-requests uint
+    {
+        unit-id: uint,
+        tenant: principal,
+        description: (string-ascii 500),
+        category: (string-ascii 50),
+        priority: uint,
+        status: (string-ascii 20),
+        created-block: uint,
+        updated-block: uint,
+        resolved-block: (optional uint)
+    }
+)
+
+(define-map unit-ratings uint
+    {
+        unit-id: uint,
+        tenant: principal,
+        rating: uint,
+        comment: (string-ascii 200),
+        created-block: uint
+    }
+)
+
 (define-data-var housing-unit-counter uint u0)
+(define-data-var maintenance-request-counter uint u0)
 
 (define-public (initialize-lottery (deadline uint) (drawing-block-height uint))
     (begin
@@ -97,7 +130,10 @@
                 rent: rent,
                 bedrooms: bedrooms,
                 allocated: false,
-                winner: none
+                winner: none,
+                quality-score: u0,
+                total-ratings: u0,
+                maintenance-issues: u0
             }
         )
         (var-set housing-unit-counter unit-id)
@@ -164,6 +200,136 @@
             })
         )
         (ok true)
+    )
+)
+
+(define-public (submit-maintenance-request (unit-id uint) (description (string-ascii 500)) (category (string-ascii 50)) (priority uint))
+    (let (
+        (unit (unwrap! (map-get? housing-units unit-id) err-invalid-housing-unit))
+        (tenant tx-sender)
+        (request-id (+ (var-get maintenance-request-counter) u1))
+    )
+        (asserts! (get allocated unit) err-invalid-housing-unit)
+        (asserts! (is-eq (some tenant) (get winner unit)) err-not-tenant)
+        (asserts! (and (>= priority u1) (<= priority u5)) err-invalid-maintenance-request)
+        (map-set maintenance-requests request-id
+            {
+                unit-id: unit-id,
+                tenant: tenant,
+                description: description,
+                category: category,
+                priority: priority,
+                status: "pending",
+                created-block: stacks-block-height,
+                updated-block: stacks-block-height,
+                resolved-block: none
+            }
+        )
+        (map-set housing-units unit-id
+            (merge unit {
+                maintenance-issues: (+ (get maintenance-issues unit) u1)
+            })
+        )
+        (var-set maintenance-request-counter request-id)
+        (ok request-id)
+    )
+)
+
+(define-public (update-maintenance-status (request-id uint) (status (string-ascii 20)))
+    (let (
+        (request (unwrap! (map-get? maintenance-requests request-id) err-request-not-found))
+        (unit (unwrap! (map-get? housing-units (get unit-id request)) err-invalid-housing-unit))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (or (is-eq status "pending") (is-eq status "in-progress") (is-eq status "completed")) err-invalid-status)
+        (map-set maintenance-requests request-id
+            (merge request {
+                status: status,
+                updated-block: stacks-block-height,
+                resolved-block: (if (is-eq status "completed") (some stacks-block-height) none)
+            })
+        )
+        (if (is-eq status "completed")
+            (map-set housing-units (get unit-id request)
+                (merge unit {
+                    maintenance-issues: (if (> (get maintenance-issues unit) u0) (- (get maintenance-issues unit) u1) u0)
+                })
+            )
+            true
+        )
+        (ok true)
+    )
+)
+
+(define-public (rate-housing-unit (unit-id uint) (rating uint) (comment (string-ascii 200)))
+    (let (
+        (unit (unwrap! (map-get? housing-units unit-id) err-invalid-housing-unit))
+        (tenant tx-sender)
+        (current-quality (get quality-score unit))
+        (current-ratings (get total-ratings unit))
+        (new-total-ratings (+ current-ratings u1))
+        (new-quality-score (/ (+ (* current-quality current-ratings) rating) new-total-ratings))
+        (rating-id (+ (var-get maintenance-request-counter) u1))
+    )
+        (asserts! (get allocated unit) err-invalid-housing-unit)
+        (asserts! (is-eq (some tenant) (get winner unit)) err-not-tenant)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (map-set unit-ratings rating-id
+            {
+                unit-id: unit-id,
+                tenant: tenant,
+                rating: rating,
+                comment: comment,
+                created-block: stacks-block-height
+            }
+        )
+        (map-set housing-units unit-id
+            (merge unit {
+                quality-score: new-quality-score,
+                total-ratings: new-total-ratings
+            })
+        )
+        (ok rating-id)
+    )
+)
+
+(define-read-only (get-maintenance-requests-by-unit (unit-id uint))
+    (let (
+        (max-requests (var-get maintenance-request-counter))
+    )
+        (filter-maintenance-requests unit-id max-requests)
+    )
+)
+
+(define-private (filter-maintenance-requests (target-unit-id uint) (max-id uint))
+    (fold filter-request-by-unit 
+        (generate-request-ids max-id)
+        {target-unit: target-unit-id, results: (list)}
+    )
+)
+
+(define-private (filter-request-by-unit (request-id uint) (state {target-unit: uint, results: (list 50 uint)}))
+    (match (map-get? maintenance-requests request-id)
+        request-data
+            (if (is-eq (get unit-id request-data) (get target-unit state))
+                {
+                    target-unit: (get target-unit state),
+                    results: (unwrap-panic (as-max-len? (append (get results state) request-id) u50))
+                }
+                state
+            )
+        state
+    )
+)
+
+(define-private (generate-request-ids (max-id uint))
+    (map generate-id (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50))
+)
+
+(define-private (generate-id (index uint))
+    (if (<= index (var-get maintenance-request-counter))
+        index
+        u0
     )
 )
 
@@ -279,4 +445,41 @@
 
 (define-read-only (get-current-block)
     stacks-block-height
+)
+
+(define-read-only (get-maintenance-request (request-id uint))
+    (map-get? maintenance-requests request-id)
+)
+
+(define-read-only (get-unit-rating (rating-id uint))
+    (map-get? unit-ratings rating-id)
+)
+
+(define-read-only (get-unit-quality-score (unit-id uint))
+    (match (map-get? housing-units unit-id)
+        unit-data (some (get quality-score unit-data))
+        none
+    )
+)
+
+(define-read-only (get-maintenance-issues-count (unit-id uint))
+    (match (map-get? housing-units unit-id)
+        unit-data (some (get maintenance-issues unit-data))
+        none
+    )
+)
+
+(define-read-only (get-unit-stats (unit-id uint))
+    (match (map-get? housing-units unit-id)
+        unit-data (some {
+            quality-score: (get quality-score unit-data),
+            total-ratings: (get total-ratings unit-data),
+            maintenance-issues: (get maintenance-issues unit-data)
+        })
+        none
+    )
+)
+
+(define-read-only (get-total-maintenance-requests)
+    (var-get maintenance-request-counter)
 )
