@@ -14,6 +14,12 @@
 (define-constant err-invalid-rating (err u112))
 (define-constant err-request-not-found (err u113))
 (define-constant err-invalid-status (err u114))
+(define-constant err-not-in-waitlist (err u115))
+(define-constant err-waitlist-full (err u116))
+(define-constant err-already-in-waitlist (err u117))
+(define-constant err-invalid-priority (err u118))
+(define-constant err-unit-not-vacated (err u119))
+(define-constant err-no-eligible-waitlist (err u120))
 
 (define-data-var lottery-active bool false)
 (define-data-var registration-deadline uint u0)
@@ -80,6 +86,39 @@
 
 (define-data-var housing-unit-counter uint u0)
 (define-data-var maintenance-request-counter uint u0)
+(define-data-var waitlist-counter uint u0)
+(define-data-var auto-allocation-enabled bool true)
+
+(define-map housing-waitlist uint
+    {
+        participant: principal,
+        registration-date: uint,
+        priority-score: uint,
+        household-size: uint,
+        preferred-bedrooms: uint,
+        special-needs: bool,
+        veteran-status: bool,
+        elderly-status: bool,
+        disabled-status: bool,
+        employment-status: (string-ascii 20),
+        current-housing-situation: (string-ascii 50),
+        waitlist-position: uint,
+        active: bool
+    }
+)
+
+(define-map participant-waitlist-id principal uint)
+
+(define-map unit-vacancies uint
+    {
+        unit-id: uint,
+        vacation-date: uint,
+        reason: (string-ascii 100),
+        next-available-date: uint,
+        allocated-from-waitlist: bool,
+        allocated-to: (optional principal)
+    }
+)
 
 (define-public (initialize-lottery (deadline uint) (drawing-block-height uint))
     (begin
@@ -483,3 +522,329 @@
 (define-read-only (get-total-maintenance-requests)
     (var-get maintenance-request-counter)
 )
+
+(define-public (join-housing-waitlist 
+    (household-size uint) 
+    (preferred-bedrooms uint) 
+    (special-needs bool) 
+    (veteran-status bool) 
+    (elderly-status bool) 
+    (disabled-status bool) 
+    (employment-status (string-ascii 20)) 
+    (current-housing-situation (string-ascii 50)))
+    (let (
+        (participant tx-sender)
+        (waitlist-id (+ (var-get waitlist-counter) u1))
+        (priority-score (calculate-priority-score household-size special-needs veteran-status elderly-status disabled-status employment-status))
+        (current-position (get-next-waitlist-position))
+    )
+        (asserts! (is-none (map-get? participant-waitlist-id participant)) err-already-in-waitlist)
+        (asserts! (<= waitlist-id u1000) err-waitlist-full)
+        (asserts! (and (>= household-size u1) (<= household-size u10)) err-invalid-priority)
+        (asserts! (and (>= preferred-bedrooms u1) (<= preferred-bedrooms u5)) err-invalid-priority)
+        (map-set housing-waitlist waitlist-id
+            {
+                participant: participant,
+                registration-date: stacks-block-height,
+                priority-score: priority-score,
+                household-size: household-size,
+                preferred-bedrooms: preferred-bedrooms,
+                special-needs: special-needs,
+                veteran-status: veteran-status,
+                elderly-status: elderly-status,
+                disabled-status: disabled-status,
+                employment-status: employment-status,
+                current-housing-situation: current-housing-situation,
+                waitlist-position: current-position,
+                active: true
+            }
+        )
+        (map-set participant-waitlist-id participant waitlist-id)
+        (var-set waitlist-counter waitlist-id)
+        (ok waitlist-id)
+    )
+)
+
+(define-public (update-waitlist-info 
+    (household-size uint) 
+    (preferred-bedrooms uint) 
+    (employment-status (string-ascii 20)) 
+    (current-housing-situation (string-ascii 50)))
+    (let (
+        (participant tx-sender)
+        (waitlist-id (unwrap! (map-get? participant-waitlist-id participant) err-not-in-waitlist))
+        (current-entry (unwrap! (map-get? housing-waitlist waitlist-id) err-not-in-waitlist))
+        (new-priority-score (calculate-priority-score 
+            household-size 
+            (get special-needs current-entry) 
+            (get veteran-status current-entry) 
+            (get elderly-status current-entry) 
+            (get disabled-status current-entry) 
+            employment-status))
+    )
+        (asserts! (get active current-entry) err-not-in-waitlist)
+        (asserts! (and (>= household-size u1) (<= household-size u10)) err-invalid-priority)
+        (asserts! (and (>= preferred-bedrooms u1) (<= preferred-bedrooms u5)) err-invalid-priority)
+        (map-set housing-waitlist waitlist-id
+            (merge current-entry {
+                household-size: household-size,
+                preferred-bedrooms: preferred-bedrooms,
+                employment-status: employment-status,
+                current-housing-situation: current-housing-situation,
+                priority-score: new-priority-score
+            })
+        )
+        (reorder-waitlist-positions)
+    )
+)
+
+(define-public (vacate-housing-unit (unit-id uint) (reason (string-ascii 100)) (next-available-date uint))
+    (let (
+        (unit (unwrap! (map-get? housing-units unit-id) err-invalid-housing-unit))
+        (vacancy-id unit-id)
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get allocated unit) err-invalid-housing-unit)
+        (asserts! (>= next-available-date stacks-block-height) err-invalid-priority)
+        (map-set unit-vacancies vacancy-id
+            {
+                unit-id: unit-id,
+                vacation-date: stacks-block-height,
+                reason: reason,
+                next-available-date: next-available-date,
+                allocated-from-waitlist: false,
+                allocated-to: none
+            }
+        )
+        (map-set housing-units unit-id
+            (merge unit {
+                allocated: false,
+                winner: none
+            })
+        )
+        (if (var-get auto-allocation-enabled)
+            (begin
+                (unwrap-panic (auto-allocate-from-waitlist unit-id))
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (auto-allocate-from-waitlist (unit-id uint))
+    (let (
+        (unit (unwrap! (map-get? housing-units unit-id) err-invalid-housing-unit))
+        (best-match (find-best-waitlist-match unit-id))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (not (get allocated unit)) err-unit-already-allocated)
+        (if (get found best-match)
+            (let (
+                (waitlist-id (get waitlist-id best-match))
+                (waitlist-entry (unwrap-panic (map-get? housing-waitlist waitlist-id)))
+                (participant (get participant waitlist-entry))
+            )
+                (map-set housing-units unit-id
+                    (merge unit {
+                        allocated: true,
+                        winner: (some participant)
+                    })
+                )
+                (map-set unit-vacancies unit-id
+                    (merge (unwrap-panic (map-get? unit-vacancies unit-id)) {
+                        allocated-from-waitlist: true,
+                        allocated-to: (some participant)
+                    })
+                )
+                (map-set housing-waitlist waitlist-id
+                    (merge waitlist-entry {
+                        active: false
+                    })
+                )
+                (map-delete participant-waitlist-id participant)
+                (unwrap-panic (reorder-waitlist-positions))
+                (ok participant)
+            )
+            err-no-eligible-waitlist
+        )
+    )
+)
+
+(define-public (remove-from-waitlist)
+    (let (
+        (participant tx-sender)
+        (waitlist-id (unwrap! (map-get? participant-waitlist-id participant) err-not-in-waitlist))
+        (waitlist-entry (unwrap! (map-get? housing-waitlist waitlist-id) err-not-in-waitlist))
+    )
+        (asserts! (get active waitlist-entry) err-not-in-waitlist)
+        (map-set housing-waitlist waitlist-id
+            (merge waitlist-entry {
+                active: false
+            })
+        )
+        (map-delete participant-waitlist-id participant)
+        (reorder-waitlist-positions)
+    )
+)
+
+(define-public (toggle-auto-allocation)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set auto-allocation-enabled (not (var-get auto-allocation-enabled)))
+        (ok (var-get auto-allocation-enabled))
+    )
+)
+
+(define-private (calculate-priority-score 
+    (household-size uint) 
+    (special-needs bool) 
+    (veteran-status bool) 
+    (elderly-status bool) 
+    (disabled-status bool) 
+    (employment-status (string-ascii 20)))
+    (let (
+        (base-score u100)
+        (household-bonus (* household-size u10))
+        (special-needs-bonus (if special-needs u50 u0))
+        (veteran-bonus (if veteran-status u30 u0))
+        (elderly-bonus (if elderly-status u25 u0))
+        (disabled-bonus (if disabled-status u40 u0))
+        (employment-bonus (if (is-eq employment-status "unemployed") u20 u0))
+    )
+        (+ base-score household-bonus special-needs-bonus veteran-bonus elderly-bonus disabled-bonus employment-bonus)
+    )
+)
+
+(define-private (get-next-waitlist-position)
+    (let (
+        (max-waitlist (var-get waitlist-counter))
+        (active-count (count-active-waitlist-entries max-waitlist))
+    )
+        (+ active-count u1)
+    )
+)
+
+(define-private (count-active-waitlist-entries (max-id uint))
+    (fold count-active-entries 
+        (generate-waitlist-ids max-id)
+        u0
+    )
+)
+
+(define-private (count-active-entries (waitlist-id uint) (count uint))
+    (match (map-get? housing-waitlist waitlist-id)
+        entry-data
+            (if (get active entry-data)
+                (+ count u1)
+                count
+            )
+        count
+    )
+)
+
+(define-private (generate-waitlist-ids (max-id uint))
+    (map generate-waitlist-id (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50))
+)
+
+(define-private (generate-waitlist-id (index uint))
+    (if (<= index (var-get waitlist-counter))
+        index
+        u0
+    )
+)
+
+(define-private (find-best-waitlist-match (unit-id uint))
+    (let (
+        (unit (unwrap-panic (map-get? housing-units unit-id)))
+        (unit-bedrooms (get bedrooms unit))
+        (max-waitlist (var-get waitlist-counter))
+    )
+        (fold find-best-match 
+            (generate-waitlist-ids max-waitlist)
+            {waitlist-id: u0, score: u0, found: false}
+        )
+    )
+)
+
+(define-private (find-best-match (waitlist-id uint) (current-best {waitlist-id: uint, score: uint, found: bool}))
+    (match (map-get? housing-waitlist waitlist-id)
+        entry-data
+            (if (and (get active entry-data) (> (get priority-score entry-data) (get score current-best)))
+                {
+                    waitlist-id: waitlist-id,
+                    score: (get priority-score entry-data),
+                    found: true
+                }
+                current-best
+            )
+        current-best
+    )
+)
+
+(define-private (reorder-waitlist-positions)
+    (let (
+        (max-waitlist (var-get waitlist-counter))
+        (final-position (fold update-waitlist-position 
+            (generate-waitlist-ids max-waitlist)
+            u1
+        ))
+    )
+        (ok true)
+    )
+)
+
+(define-private (update-waitlist-position (waitlist-id uint) (position uint))
+    (match (map-get? housing-waitlist waitlist-id)
+        entry-data
+            (if (get active entry-data)
+                (begin
+                    (map-set housing-waitlist waitlist-id
+                        (merge entry-data {
+                            waitlist-position: position
+                        })
+                    )
+                    (+ position u1)
+                )
+                position
+            )
+        position
+    )
+)
+
+(define-read-only (get-waitlist-entry (waitlist-id uint))
+    (map-get? housing-waitlist waitlist-id)
+)
+
+(define-read-only (get-participant-waitlist-position (participant principal))
+    (match (map-get? participant-waitlist-id participant)
+        waitlist-id 
+            (match (map-get? housing-waitlist waitlist-id)
+                entry-data (some (get waitlist-position entry-data))
+                none
+            )
+        none
+    )
+)
+
+(define-read-only (get-waitlist-stats)
+    {
+        total-entries: (var-get waitlist-counter),
+        active-entries: (count-active-waitlist-entries (var-get waitlist-counter)),
+        auto-allocation-enabled: (var-get auto-allocation-enabled)
+    }
+)
+
+(define-read-only (get-unit-vacancy-info (unit-id uint))
+    (map-get? unit-vacancies unit-id)
+)
+
+(define-read-only (get-participant-waitlist-info (participant principal))
+    (match (map-get? participant-waitlist-id participant)
+        waitlist-id (map-get? housing-waitlist waitlist-id)
+        none
+    )
+)
+
+
+
