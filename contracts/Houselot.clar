@@ -20,6 +20,11 @@
 (define-constant err-invalid-priority (err u118))
 (define-constant err-unit-not-vacated (err u119))
 (define-constant err-no-eligible-waitlist (err u120))
+(define-constant err-document-not-found (err u121))
+(define-constant err-invalid-document-type (err u122))
+(define-constant err-document-expired (err u123))
+(define-constant err-not-authorized-to-view (err u124))
+(define-constant err-document-already-verified (err u125))
 
 (define-data-var lottery-active bool false)
 (define-data-var registration-deadline uint u0)
@@ -88,6 +93,47 @@
 (define-data-var maintenance-request-counter uint u0)
 (define-data-var waitlist-counter uint u0)
 (define-data-var auto-allocation-enabled bool true)
+(define-data-var document-counter uint u0)
+
+;; Document Management System Maps
+(define-map housing-documents uint
+    {
+        unit-id: uint,
+        uploader: principal,
+        document-type: (string-ascii 50),
+        title: (string-ascii 100),
+        description: (string-ascii 300),
+        file-hash: (string-ascii 64),
+        upload-date: uint,
+        expiration-date: (optional uint),
+        verification-status: (string-ascii 20),
+        verifier: (optional principal),
+        verification-date: (optional uint),
+        access-level: (string-ascii 20),
+        file-size: uint,
+        is-active: bool
+    }
+)
+
+;; Map of valid document types with their descriptions and retention periods
+(define-map document-types (string-ascii 50)
+    {
+        description: (string-ascii 100),
+        retention-period: uint,  ;; Number of blocks before document expires (0 = no expiration)
+        required-for-tenants: bool,
+        required-for-application: bool
+    }
+)
+
+;; Map of document access permissions by principal
+(define-map document-access-permissions 
+    {document-id: uint, accessor: principal}
+    {can-view: bool, can-verify: bool, granted-by: principal, granted-at: uint}
+)
+
+;; Map tracking documents by unit and by tenant
+(define-map unit-documents uint (list 100 uint))
+(define-map tenant-documents principal (list 100 uint))
 
 (define-map housing-waitlist uint
     {
@@ -846,5 +892,332 @@
     )
 )
 
+;; ====== DOCUMENT MANAGEMENT SYSTEM FUNCTIONS ======
+
+;; Initialize default document types (called once by contract owner)
+(define-public (initialize-document-types)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set document-types "lease-agreement"
+            {
+                description: "Lease agreement between tenant and housing authority",
+                retention-period: u52596,  ;; ~1 year in blocks (assuming 10-min blocks)
+                required-for-tenants: true,
+                required-for-application: false
+            }
+        )
+        (map-set document-types "income-verification"
+            {
+                description: "Proof of income documentation",
+                retention-period: u26298,  ;; ~6 months in blocks
+                required-for-tenants: true,
+                required-for-application: true
+            }
+        )
+        (map-set document-types "identity-verification"
+            {
+                description: "Government issued identification documents",
+                retention-period: u0,  ;; No expiration
+                required-for-tenants: true,
+                required-for-application: true
+            }
+        )
+        (map-set document-types "inspection-report"
+            {
+                description: "Housing unit inspection reports",
+                retention-period: u78894,  ;; ~18 months in blocks
+                required-for-tenants: false,
+                required-for-application: false
+            }
+        )
+        (map-set document-types "maintenance-receipt"
+            {
+                description: "Maintenance work completion receipts",
+                retention-period: u26298,  ;; ~6 months in blocks
+                required-for-tenants: false,
+                required-for-application: false
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Upload a new document
+(define-public (upload-document 
+    (unit-id uint)
+    (document-type (string-ascii 50))
+    (title (string-ascii 100))
+    (description (string-ascii 300))
+    (file-hash (string-ascii 64))
+    (file-size uint)
+    (access-level (string-ascii 20)))
+    (let (
+        (document-id (+ (var-get document-counter) u1))
+        (document-type-info (unwrap! (map-get? document-types document-type) err-invalid-document-type))
+        (unit (unwrap! (map-get? housing-units unit-id) err-invalid-housing-unit))
+        (uploader tx-sender)
+        (expiration-date (if (> (get retention-period document-type-info) u0)
+            (some (+ stacks-block-height (get retention-period document-type-info)))
+            none
+        ))
+        (current-unit-docs (default-to (list) (map-get? unit-documents unit-id)))
+        (current-tenant-docs (default-to (list) (map-get? tenant-documents uploader)))
+    )
+        (asserts! (or (is-eq uploader contract-owner)
+                     (is-eq (some uploader) (get winner unit))
+                     (get allocated unit)) err-not-authorized-to-view)
+        (asserts! (or (is-eq access-level "public")
+                     (is-eq access-level "tenant-only")
+                     (is-eq access-level "admin-only")
+                     (is-eq access-level "private")) err-invalid-status)
+        (asserts! (> file-size u0) err-invalid-document-type)
+        (asserts! (> (len file-hash) u0) err-invalid-document-type)
+        
+        (map-set housing-documents document-id
+            {
+                unit-id: unit-id,
+                uploader: uploader,
+                document-type: document-type,
+                title: title,
+                description: description,
+                file-hash: file-hash,
+                upload-date: stacks-block-height,
+                expiration-date: expiration-date,
+                verification-status: "pending",
+                verifier: none,
+                verification-date: none,
+                access-level: access-level,
+                file-size: file-size,
+                is-active: true
+            }
+        )
+        
+        (map-set unit-documents unit-id
+            (unwrap-panic (as-max-len? (append current-unit-docs document-id) u100))
+        )
+        
+        (map-set tenant-documents uploader
+            (unwrap-panic (as-max-len? (append current-tenant-docs document-id) u100))
+        )
+        
+        (var-set document-counter document-id)
+        (ok document-id)
+    )
+)
+
+;; View a document (with access control)
+(define-read-only (get-document (document-id uint))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+        (access-level (get access-level document))
+        (uploader (get uploader document))
+        (viewer tx-sender)
+        (unit (unwrap! (map-get? housing-units (get unit-id document)) err-invalid-housing-unit))
+        (is-tenant (is-eq (some viewer) (get winner unit)))
+        (has-permission (map-get? document-access-permissions {document-id: document-id, accessor: viewer}))
+    )
+        (asserts! (get is-active document) err-document-not-found)
+        (asserts! 
+            (or 
+                (is-eq viewer contract-owner)  ;; Admin can view all
+                (is-eq viewer uploader)  ;; Uploader can view own documents
+                (and is-tenant (or (is-eq access-level "public") (is-eq access-level "tenant-only")))  ;; Tenant access
+                (is-eq access-level "public")  ;; Public documents
+                (and (is-some has-permission) (get can-view (unwrap-panic has-permission)))
+            )
+            err-not-authorized-to-view
+        )
+        
+        ;; Check if document is expired
+        (match (get expiration-date document)
+            expiry-date
+                (asserts! (<= stacks-block-height expiry-date) err-document-expired)
+            true
+        )
+        
+        (ok document)
+    )
+)
+
+;; Verify a document (admin only)
+(define-public (verify-document (document-id uint) (verification-status (string-ascii 20)))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+        (verifier tx-sender)
+    )
+        (asserts! (is-eq verifier contract-owner) err-owner-only)
+        (asserts! (get is-active document) err-document-not-found)
+        (asserts! (is-eq (get verification-status document) "pending") err-document-already-verified)
+        (asserts! (or (is-eq verification-status "verified") 
+                     (is-eq verification-status "rejected") 
+                     (is-eq verification-status "needs-update")) err-invalid-status)
+        
+        (map-set housing-documents document-id
+            (merge document {
+                verification-status: verification-status,
+                verifier: (some verifier),
+                verification-date: (some stacks-block-height)
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Grant document access permission
+(define-public (grant-document-access 
+    (document-id uint)
+    (accessor principal)
+    (can-view bool)
+    (can-verify bool))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+        (granter tx-sender)
+    )
+        (asserts! (or (is-eq granter contract-owner) (is-eq granter (get uploader document))) err-not-authorized-to-view)
+        (asserts! (get is-active document) err-document-not-found)
+        
+        (map-set document-access-permissions {document-id: document-id, accessor: accessor}
+            {
+                can-view: can-view,
+                can-verify: can-verify,
+                granted-by: granter,
+                granted-at: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Revoke document access permission
+(define-public (revoke-document-access (document-id uint) (accessor principal))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+        (revoker tx-sender)
+    )
+        (asserts! (or (is-eq revoker contract-owner) (is-eq revoker (get uploader document))) err-not-authorized-to-view)
+        (map-delete document-access-permissions {document-id: document-id, accessor: accessor})
+        (ok true)
+    )
+)
+
+;; Deactivate a document (soft delete)
+(define-public (deactivate-document (document-id uint))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+        (requester tx-sender)
+    )
+        (asserts! (or (is-eq requester contract-owner) (is-eq requester (get uploader document))) err-not-authorized-to-view)
+        (asserts! (get is-active document) err-document-not-found)
+        
+        (map-set housing-documents document-id
+            (merge document {
+                is-active: false
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Get documents by unit
+(define-read-only (get-unit-documents (unit-id uint))
+    (let (
+        (unit (unwrap! (map-get? housing-units unit-id) err-invalid-housing-unit))
+        (viewer tx-sender)
+        (is-tenant (is-eq (some viewer) (get winner unit)))
+    )
+        (asserts! (or (is-eq viewer contract-owner) is-tenant) err-not-authorized-to-view)
+        (ok (default-to (list) (map-get? unit-documents unit-id)))
+    )
+)
+
+;; Get documents by tenant
+(define-read-only (get-tenant-documents (tenant principal))
+    (let (
+        (viewer tx-sender)
+    )
+        (asserts! (or (is-eq viewer contract-owner) (is-eq viewer tenant)) err-not-authorized-to-view)
+        (ok (default-to (list) (map-get? tenant-documents tenant)))
+    )
+)
+
+;; Get document verification status
+(define-read-only (get-document-verification (document-id uint))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+        (viewer tx-sender)
+        (uploader (get uploader document))
+    )
+        (asserts! (or (is-eq viewer contract-owner) (is-eq viewer uploader)) err-not-authorized-to-view)
+        (asserts! (get is-active document) err-document-not-found)
+        
+        (ok {
+            verification-status: (get verification-status document),
+            verifier: (get verifier document),
+            verification-date: (get verification-date document)
+        })
+    )
+)
+
+;; Check if document is expired
+(define-read-only (is-document-expired (document-id uint))
+    (let (
+        (document (unwrap! (map-get? housing-documents document-id) err-document-not-found))
+    )
+        (match (get expiration-date document)
+            expiry-date (ok (> stacks-block-height expiry-date))
+            (ok false)
+        )
+    )
+)
+
+;; Get document type information
+(define-read-only (get-document-type-info (document-type (string-ascii 50)))
+    (ok (map-get? document-types document-type))
+)
+
+;; Get total document count
+(define-read-only (get-total-documents)
+    (ok (var-get document-counter))
+)
+
+;; Get documents requiring verification
+(define-read-only (get-pending-verifications)
+    (let (
+        (max-docs (var-get document-counter))
+        (viewer tx-sender)
+    )
+        (asserts! (is-eq viewer contract-owner) err-owner-only)
+        (ok (filter-pending-documents max-docs))
+    )
+)
+
+(define-private (filter-pending-documents (max-id uint))
+    (fold filter-by-pending-status
+        (generate-document-ids max-id)
+        (list)
+    )
+)
+
+(define-private (filter-by-pending-status (document-id uint) (results (list 100 uint)))
+    (match (map-get? housing-documents document-id)
+        document-data
+            (if (and (get is-active document-data) (is-eq (get verification-status document-data) "pending"))
+                (unwrap-panic (as-max-len? (append results document-id) u100))
+                results
+            )
+        results
+    )
+)
+
+(define-private (generate-document-ids (max-id uint))
+    (map generate-doc-id (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50 u51 u52 u53 u54 u55 u56 u57 u58 u59 u60 u61 u62 u63 u64 u65 u66 u67 u68 u69 u70 u71 u72 u73 u74 u75 u76 u77 u78 u79 u80 u81 u82 u83 u84 u85 u86 u87 u88 u89 u90 u91 u92 u93 u94 u95 u96 u97 u98 u99 u100))
+)
+
+(define-private (generate-doc-id (index uint))
+    (if (<= index (var-get document-counter))
+        index
+        u0
+    )
+)
 
 
